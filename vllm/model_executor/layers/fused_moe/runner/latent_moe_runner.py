@@ -12,6 +12,7 @@ from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
     flashinfer_trtllm_fused_allreduce_norm,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.utils.multi_stream_utils import record_stream_if_safe
 from vllm.utils.torch_utils import aux_stream, current_stream
 
 from .moe_runner import MoERunner, _unpack
@@ -200,12 +201,15 @@ class LatentMoERunner(MoERunner):
         if shared_expert_stream is not None:
             # overlap shared expert allreduce with latent up_proj
             main = current_stream()
-            shared_output.record_stream(shared_expert_stream)
+            record_stream_if_safe(shared_output, shared_expert_stream)
             shared_expert_stream.wait_stream(main)
             with torch.cuda.stream(shared_expert_stream):
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
             result = torch.mm(fused_latent, transform.up_proj.weight.t())
             main.wait_stream(shared_expert_stream)
+            # The all-reduce output is a new aux-stream allocation consumed
+            # below on the main stream.
+            record_stream_if_safe(shared_output, main)
         else:
             shared_output = tensor_model_parallel_all_reduce(shared_output)
             result = torch.mm(fused_latent, transform.up_proj.weight.t())

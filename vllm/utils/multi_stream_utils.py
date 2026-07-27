@@ -8,6 +8,31 @@ from typing import Any
 import torch
 
 
+def record_stream_if_safe(value: Any, stream: torch.cuda.Stream) -> None:
+    """Mark aux-stream allocations as also used on ``stream``.
+
+    A tensor produced inside ``with torch.cuda.stream(aux)`` is owned by the
+    caching allocator's ``aux`` pool. Stream ordering (events / ``wait_stream``)
+    makes the consumer run after the producer, but it does not stop the
+    allocator from handing the block to a later ``aux`` allocation while the
+    consumer is still reading it. ``record_stream`` is what defers that reuse.
+
+    Skipped during CUDA graph capture, where allocations come from the
+    graph-private pool and are not recycled.
+
+    Args:
+        value: A tensor, or a tuple/list that may contain tensors. Non-tensor
+            entries are ignored.
+        stream: The stream the tensors are consumed on.
+    """
+    if not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
+        return
+    values = value if isinstance(value, (tuple, list)) else (value,)
+    for v in values:
+        if isinstance(v, torch.Tensor):
+            v.record_stream(stream)
+
+
 class AuxStreamType(Enum):
     Attention = 1
 
@@ -60,6 +85,7 @@ def maybe_execute_in_parallel(
             result1 = fn1()
             event1.record()
         event1.wait()
+        record_stream_if_safe(result1, torch.cuda.current_stream())
     else:
         result0 = fn0()
         result1 = fn1()
@@ -132,5 +158,9 @@ def execute_in_parallel(
 
     for ev in pending:
         ev.wait()
+
+    current = torch.cuda.current_stream()
+    for res in aux_results:
+        record_stream_if_safe(res, current)
 
     return default_result, aux_results
