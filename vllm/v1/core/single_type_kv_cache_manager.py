@@ -911,7 +911,17 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         )
         assert dcp_world_size == 1, "DCP not support sliding window attn now."
         assert pcp_world_size == 1, "PCP not support sliding window attn now."
-        # Fine-grained partial hits are not supported for sliding window now
+        # The scan below indexes `block_hashes` in whole blocks, so a finer
+        # alignment would read the wrong entries. The coordinator keeps this
+        # unreachable by disabling partial hash hits for models containing a
+        # group that only supports block-aligned lookup.
+        # TODO: supporting them here would let a mamba-"align" + sliding-window
+        # model keep its partial hits instead of falling back. It needs a
+        # block-size view for the contiguous-run scan alongside the raw hashes
+        # (as FullAttentionManager keeps), a partial-tail cache entry to match
+        # against, a `reachable_block_mask` that accepts a sub-block alignment,
+        # and a contiguous-block requirement computed from the partial tail
+        # length rather than once from the window.
         assert alignment_tokens % kv_cache_spec.block_size == 0, (
             "SlidingWindowManager does not support fine-grained (partial) cache hits"
         )

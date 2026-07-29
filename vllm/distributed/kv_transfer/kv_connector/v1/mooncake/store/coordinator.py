@@ -405,9 +405,22 @@ def partial_hash_hits_enabled(
     (its dcp == 1 clause holds: the connector rejects hybrid + DCP/PCP > 1).
     Single copy on purpose — scheduler and coordinator must not disagree.
     """
-    return any(
-        isinstance(spec := _unwrap_spec(g.kv_cache_spec), MambaSpec)
+    specs = [_unwrap_spec(g.kv_cache_spec) for g in kv_cache_groups]
+    if not any(
+        isinstance(spec, MambaSpec)
         and spec.mamba_cache_mode == "align"
         and spec.block_size > hash_block_size
-        for g in kv_cache_groups
-    )
+        for spec in specs
+    ):
+        return False
+    # Mirrors core's ``_all_groups_allow_partial_hash_hits``: a manager without
+    # fine-grained lookup indexes hashes in units of its own block size.
+    for spec in specs:
+        manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+        assert manager_cls is not None, f"No manager registered for KVCacheSpec {spec}"
+        if (
+            not manager_cls.supports_fine_grained_hash_lookup
+            and spec.block_size != hash_block_size
+        ):
+            return False
+    return True

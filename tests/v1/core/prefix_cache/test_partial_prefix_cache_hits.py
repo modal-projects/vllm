@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    SlidingWindowSpec,
 )
 
 
@@ -1107,3 +1108,112 @@ def test_hybrid_partial_hit_with_eagle_stays_within_group_blocks():
         len(group) * block_size >= num_computed for group in computed_blocks.blocks
     )
     assert manager.allocate_slots(req1, 4, num_computed, computed_blocks) is not None
+
+
+def test_hybrid_sliding_window_group_keeps_block_aligned_hits():
+    """A sliding-window group makes the whole model fall back to
+    block-aligned hits. ``SlidingWindowManager.find_longest_cache_hit``
+    indexes ``block_hashes`` in whole blocks, so a hash-granularity alignment
+    would read the wrong entries; it asserts instead, which used to abort the
+    engine on the first request of a mamba-"align" + SWA model."""
+    hash_block_size = 2
+    block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["swa"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=block_size,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+    req0 = make_request("0", tokens, hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
+    assert manager.allocate_slots(req0, 8, num_computed, computed_blocks) is not None
+    manager.cache_blocks(req0, 8)
+    swa_block_ids = [b.block_id for b in manager.get_blocks("0").blocks[0]]
+    manager.free(req0)
+    manager.new_step_starts()
+
+    req1 = make_request("1", tokens + [9, 10, 11, 12], hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(req1)
+    assert not manager.coordinator.enable_partial_hash_hits
+    assert num_computed == 8
+    # Out-of-window positions come back null, but every matched block must sit
+    # at the position it was cached at, not at that of its trailing hash unit.
+    swa_hit = computed_blocks.blocks[0]
+    null_block = manager.block_pool.null_block
+    assert len(swa_hit) * block_size == num_computed
+    assert swa_hit[-1] is not null_block
+    assert all(
+        block is null_block or block.block_id == swa_block_ids[i]
+        for i, block in enumerate(swa_hit)
+    )
+
+
+def test_hybrid_without_block_aligned_group_keeps_fine_grained_hits():
+    """The control for the fallback above.
+
+    The gate is a conjunction, so it can only ever over-fire. Without a
+    block-aligned-only group the mamba-"align" model must still get its
+    fine-grained partial hits, at a hit length that is not a multiple of the
+    physical block size.
+    """
+    hash_block_size = 2
+    block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    assert manager.coordinator.enable_partial_hash_hits

@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from typing import NamedTuple
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -25,6 +26,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 def _validate_prefix_cache_retention_interval(
@@ -55,6 +58,46 @@ def _validate_prefix_cache_retention_interval(
             "must be non-negative and a multiple of scheduler_block_size "
             f"({scheduler_block_size})."
         )
+
+
+def _all_groups_allow_partial_hash_hits(
+    managers: Sequence[SingleTypeKVCacheManager], hash_block_size: int
+) -> bool:
+    """Whether every group can be looked up at ``hash_block_size`` granularity.
+
+    A manager without fine-grained lookup indexes the block-hash list in units
+    of its own block size, so it can only join a fine-grained lookup when its
+    blocks are already hash-sized. Including one at a finer alignment would
+    key its lookups off the wrong hashes, so the whole model falls back to
+    scheduler-block-aligned hits instead.
+
+    Args:
+        managers: One manager per KV cache group.
+        hash_block_size: The granularity ``Request.block_hashes`` is computed at.
+
+    Returns:
+        True if fine-grained partial hits may be enabled.
+    """
+    # Compares the spec's block size rather than the manager's, which is scaled
+    # by the DCP world size, so this reads identically to the Mooncake mirror in
+    # `partial_hash_hits_enabled`. Both are gated on dcp == 1 today, so the two
+    # agree either way.
+    unsupported = {
+        type(manager).__name__
+        for manager in managers
+        if not manager.supports_fine_grained_hash_lookup
+        and manager.kv_cache_spec.block_size != hash_block_size
+    }
+    if not unsupported:
+        return True
+    logger.warning_once(
+        "Disabling fine-grained (partial) prefix-cache hits: the prefix match "
+        "unit is %d but these block-aligned-only KV cache managers use a "
+        "larger block size: %s.",
+        hash_block_size,
+        ", ".join(sorted(unsupported)),
+    )
+    return False
 
 
 class KVCacheCoordinator(ABC):
@@ -579,12 +622,19 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     f"{type(g.kv_cache_spec).__name__}."
                 )
         # Partial hash hits are limited to full-attention + mamba ("align")
-        # without context parallelism.
-        self.enable_partial_hash_hits = dcp_world_size == 1 and any(
-            isinstance(g.kv_cache_spec, MambaSpec)
-            and g.kv_cache_spec.mamba_cache_mode == "align"
-            and g.kv_cache_spec.block_size > hash_block_size
-            for g in kv_cache_config.kv_cache_groups
+        # without context parallelism, and only when no other group forces
+        # block-aligned lookup.
+        self.enable_partial_hash_hits = (
+            dcp_world_size == 1
+            and any(
+                isinstance(g.kv_cache_spec, MambaSpec)
+                and g.kv_cache_spec.mamba_cache_mode == "align"
+                and g.kv_cache_spec.block_size > hash_block_size
+                for g in kv_cache_config.kv_cache_groups
+            )
+            and _all_groups_allow_partial_hash_hits(
+                self.single_type_managers, hash_block_size
+            )
         )
         self.verify_and_split_kv_cache_groups()
 
