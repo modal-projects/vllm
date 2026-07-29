@@ -873,11 +873,12 @@ class Platform:
 
         # Get kernel block alignment from the backend's supported sizes
         with set_current_vllm_config(vllm_config):
+            backend_min_block_size = min(
+                s.base if isinstance(s, MultipleOf) else s
+                for s in backend_cls.get_supported_kernel_block_sizes()
+            )
             kernel_block_alignment_size = max(
-                min(
-                    s.base if isinstance(s, MultipleOf) else s
-                    for s in backend_cls.get_supported_kernel_block_sizes()
-                ),
+                backend_min_block_size,
                 cache_config.block_size,
             )
             if model_config.use_mla:
@@ -886,6 +887,29 @@ class Platform:
                 # For hybrid MLA/Mamba models, make the manager block size a
                 # multiple of 128 so split kernel blocks keep that invariant.
                 kernel_block_alignment_size = max(kernel_block_alignment_size, 128)
+
+        # The `max` above silently discards a user `--block-size` at or below
+        # the backend's minimum, so such a value is indistinguishable from
+        # passing nothing -- including from the resulting logs, since the line
+        # below reports the derived attention block size rather than the input
+        # that produced it. On a hybrid model the derived size also sets the
+        # prefix-cache match granularity, so two lanes that differ only in an
+        # ignored `--block-size` can end up with different cache behaviour for
+        # reasons nothing in the output explains. Say so once.
+        if (
+            cache_config.user_specified_block_size
+            and cache_config.block_size <= backend_min_block_size
+        ):
+            logger.warning_once(
+                "--block-size %d has no effect: %s requires at least %d, so "
+                "block size alignment uses %d instead. Pass a value above %d "
+                "to change the derived attention block size.",
+                cache_config.block_size,
+                backend_cls.__name__,
+                backend_min_block_size,
+                backend_min_block_size,
+                backend_min_block_size,
+            )
 
         if cache_config.mamba_cache_mode == "all":
             # With prefix caching, align to mamba chunk size for kernel perf
